@@ -66,17 +66,17 @@ good at. The whole of this document exists because they cannot be combined.
 The mesh contributes nothing to this chart. It appears only because enrolling in it
 removes the mechanism in the middle column.
 
-| | Cloud Foundry today | Option 1: FQDN policy on, mesh off | Option 2: FQDN policy off, mesh-native egress |
-|---|---|---|---|
-| Per-application outbound allowlist | yes, application security groups | yes | yes |
-| Destination expressed as | hostname | hostname | hostname |
-| Matched on | address | resolved address | TLS server name |
-| Separates destinations sharing one address | no | no | yes |
-| Port control | yes | yes | yes |
-| Enforcement point | platform | kernel dataplane | proxy in the application's own pod |
-| Is that enforcement a security boundary | yes | yes | no, by Google's and Istio's own statements |
-| Scope of the on/off switch | per application | per application | mesh-wide ConfigMap |
-| Objects per external destination | one list entry | one policy entry | one `ServiceEntry` per namespace |
+| | Cloud Foundry today | Option 1: FQDN policy on, mesh off | Option 2: FQDN policy off, mesh-native egress | What this means in practice |
+|---|---|---|---|---|
+| Per-application outbound allowlist | yes, application security groups | yes | yes | batch may reach `my.geotab.com`; correlator may not, because it never declared it |
+| Destination expressed as | hostname | hostname | hostname | the operator writes `login.microsoftonline.com`, not an address range |
+| Matched on | address | resolved address | TLS server name | the first two resolve the name, then enforce on whatever address came back; the third reads the name out of the TLS handshake |
+| Separates destinations sharing one address | no | no | yes | `example.com` resolves to a Cloudflare edge address that serves many other sites; permitting one permits every site on that address |
+| Port control | yes | yes | yes | `login.microsoftonline.com` on 443 allowed, the same host on 8443 dropped |
+| Enforcement point | platform | kernel dataplane | proxy in the application's own pod | in Option 1 the application cannot get around it; in Option 2 the thing deciding runs beside the application |
+| Is that enforcement a security boundary | yes | yes | no, by Google's and Istio's own statements | Istio: "a malicious application can bypass the Istio sidecar proxy" |
+| Scope of the on/off switch | per application | per application | mesh-wide ConfigMap | one setting turns it on for every enrolled namespace at once, so all 90 applications need their rules in place first |
+| Objects per external destination | one list entry | one policy entry | one `ServiceEntry` per namespace | 41 destinations across the estate, several shared by many applications, so shared ones are declared repeatedly |
 
 ### What the Chart A rows mean
 
@@ -189,16 +189,15 @@ number.
 FQDN policy contributes nothing to this chart. It appears only because it is what has
 to be switched off to reach the right-hand column.
 
-| | Cloud Foundry today | Option 1: mesh off, FQDN policy on | Option 2: mesh on, FQDN policy off |
-|---|---|---|---|
-| Transport between applications | cleartext over the overlay | cleartext on the pod network, inside a VPC Google encrypts by default | mTLS end to end |
-| Who may call whom | IP-based application security groups | NetworkPolicy, by namespace and pod label | also `AuthorizationPolicy`, by service account identity |
-| Caller identity at the transport | none | none | `cluster.local/ns/<namespace>/sa/<service account>` |
-| Caller identity in the application | Azure AD token | Azure AD token | Azure AD token, unchanged |
-| Path or method control | no | no | yes |
-| Per-service-pair telemetry, no code change | no | no | yes |
-| Resilience against a slow or failing dependency | libraries present but not in use | none in the platform | circuit breaking and outlier ejection per destination |
-| Cost | none | none | a proxy container per pod, and every caller must also be in the mesh |
+| | Cloud Foundry today | Option 1: mesh off, FQDN policy on | Option 2: mesh on, FQDN policy off | What this means in practice |
+|---|---|---|---|---|
+| Transport between applications | cleartext over the overlay | cleartext on the pod network, inside a VPC Google encrypts by default | mTLS end to end | batch calling correlator: encrypted by the network today, encrypted by the workloads themselves under Option 2 |
+| Who may call whom | IP-based application security groups | NetworkPolicy, by namespace and pod label | also `AuthorizationPolicy`, by service account identity | correlator names batch and sonnette as permitted callers; everything else is dropped |
+| Caller identity at the transport | none | none | `cluster.local/ns/<namespace>/sa/<service account>` | the callee can prove which workload connected, rather than trusting a label |
+| Caller identity in the application | Azure AD token | Azure AD token | Azure AD token, unchanged | no application code changes in any column |
+| Path or method control | no | no | yes | batch could be permitted `GET /api/*` on correlator and denied `DELETE` |
+| Per-service-pair telemetry, no code change | no | no | yes | who calls correlator, how often, and what share of those calls fail |
+| Resilience against a slow or failing dependency | libraries present but not in use | none in the platform | circuit breaking and outlier ejection per destination | one slow callee stops filling the caller's threads and taking it down too |
 
 The middle column is already an improvement on what is being replaced: the caller is
 identified by workload rather than by address, and both ends must permit the call.
