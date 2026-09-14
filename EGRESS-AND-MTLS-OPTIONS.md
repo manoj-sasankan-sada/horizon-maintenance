@@ -1,23 +1,83 @@
-# Two supported designs for egress control
+# Egress control and mTLS: the two designs
 
 Google Cloud Support, case 75419399, established that FQDN network policy and Cloud
-Service Mesh cannot be combined on a namespace enrolled in the dataplane, in either
-sidecar or ambient mode, and that the supported way to do per-application egress
-allowlisting on a meshed namespace is the mesh's own controls.
+Service Mesh cannot be combined on a namespace enrolled in the mesh dataplane, in
+either sidecar or ambient mode. A namespace not enrolled keeps FQDN policy working
+normally. The supported way to do per-application egress allowlisting on a meshed
+namespace is the mesh's own controls.
 
-That leaves two designs.
+That makes this a choice between two designs, not a set of features to combine.
 
-| | **Option 1** | **Option 2** |
+| | Option 1 | Option 2 |
 |---|---|---|
 | Mesh dataplane | not enrolled | enrolled, STRICT mTLS |
 | Internet egress | `FQDNNetworkPolicy` | `ServiceEntry` under `REGISTRY_ONLY` |
 | East-west | NetworkPolicy | NetworkPolicy and `AuthorizationPolicy` |
-| Encryption between applications | none | mTLS |
+| Encryption between applications | none added | mTLS |
 
-## What Option 2 replaces, and what it does not
+## Two different questions
+
+The decision touches two separate paths, and conflating them is the usual source of
+confusion.
+
+```
+      inside the cluster                    |     leaving the cluster
+                                            |
+  batch          ====mTLS====> correlator   |  correlator --- TLS ---> Cloud SQL, over PSC
+  mesh ingress   ====mTLS====> correlator   |  correlator --- TLS ---> Firestore
+  correlator     ====mTLS====> sonnette     |  batch      --- TLS ---> login.microsoftonline.com
+                                            |  batch      --- TLS ---> Geotab
+                                            |
+  both ends prove identity with a           |  the far end proves identity; the client
+  certificate the mesh issues               |  proves it with a token or a credential
+```
+
+**Outbound calls are already TLS.** They terminate at the service being called, and
+the client authenticates with an OAuth token, a database credential or a Google
+service account. The mesh does not change them and is not intended to. What the two
+options differ on outbound is *which destinations an application may reach*, not
+whether the call is encrypted.
+
+**Inside the cluster is where mTLS applies.** This is the only place the mesh changes
+the transport.
+
+So read the two charts below as answering two different questions.
+
+## Chart A: outbound, which destinations may an application reach
+
+| | Cloud Foundry today | Option 1: FQDN policy, no mesh | Option 2: mesh, mesh-native egress |
+|---|---|---|---|
+| Per-application outbound allowlist | yes, application security groups | yes | yes |
+| Destination expressed as | hostname | hostname | hostname |
+| Matched on | address | resolved address | TLS server name |
+| Separates destinations sharing one address | no | no | yes |
+| Port control | yes | yes | yes |
+| Enforcement point | platform | kernel dataplane | proxy in the application's own pod |
+| Is that enforcement a security boundary | yes | yes | no, by Google's and Istio's own statements |
+| Scope of the on/off switch | per application | per application | mesh-wide ConfigMap |
+| Objects per external destination | one list entry | one policy entry | one `ServiceEntry` per namespace |
+
+## Chart B: inside the cluster, application to application
+
+| | Cloud Foundry today | Option 1: mesh off | Option 2: mesh on |
+|---|---|---|---|
+| Transport between applications | cleartext over the overlay | cleartext on the pod network, inside a VPC Google encrypts by default | mTLS end to end |
+| Who may call whom | IP-based application security groups | NetworkPolicy, by namespace and pod label | also `AuthorizationPolicy`, by service account identity |
+| Caller identity at the transport | none | none | `cluster.local/ns/<namespace>/sa/<service account>` |
+| Caller identity in the application | Azure AD token | Azure AD token | Azure AD token, unchanged |
+| Path or method control | no | no | yes |
+| Per-service-pair telemetry, no code change | no | no | yes |
+| Resilience | none in the platform | none in the platform | circuit breaking and outlier ejection per destination |
+| Cost | none | none | a proxy container per pod, and every caller must also be in the mesh |
+
+The middle column is already an improvement on what is being replaced: the caller is
+identified by workload rather than by address, and both ends must permit the call.
+The right-hand column is a further step from there, not a repair of a gap.
+
+## What Option 2 changes in the policy set
 
 `FQDNNetworkPolicy` is replaced. Nothing else is. Of the seven policy shapes the
-chart renders per application, six are unchanged and continue to be required.
+chart renders per application, six are unchanged and still required.
 
 | Policy | Option 1 | Option 2 |
 |---|---|---|
@@ -33,93 +93,48 @@ The internet egress NetworkPolicy does not disappear in Option 2, it widens. Pub
 destinations cannot be written as CIDRs, so the layer 4 rule opens 443 broadly and
 the per-host decision moves into the proxy.
 
-## The comparison
-
-| | Cloud Foundry today | Option 1: FQDN policy, no mesh | Option 2: mesh, STRICT mTLS, mesh-native egress |
-|---|---|---|---|
-| **Outbound** | | | |
-| Per-application outbound allowlist | yes, application security groups | yes | yes |
-| Destination expressed as | hostname | hostname | hostname |
-| Matched on | address | resolved address | TLS server name |
-| Separates destinations sharing one address | no | no | yes |
-| Port control | yes | yes | yes |
-| Enforcement point | platform | kernel dataplane | proxy in the application's own pod |
-| Is that enforcement a security boundary | yes | yes | **no, by Google's and Istio's own statements** |
-| Scope of the on/off switch | per application | per application | **mesh-wide ConfigMap** |
-| **Inbound** | | | |
-| Per-caller control | yes, `ingress.apps` | yes | yes |
-| Caller identified by | platform identity | namespace and pod labels | workload certificate |
-| Port control | yes | yes | yes |
-| Path or method control | no | no | yes |
-| **In transit** | | | |
-| Encryption between applications | no | no | yes |
-| Proof of which workload called | no | no | yes |
-| **Operations** | | | |
-| Per-service-pair metrics, no code change | no | no | yes |
-| Retries, timeouts, circuit breaking in the platform | no | no | yes |
-| Cost per pod | n/a | none | a proxy container, billed on Autopilot |
-| Pod start depends on a control plane | no | no | yes |
-| Objects per external destination | one list entry | one policy entry | one `ServiceEntry` per namespace |
-| Skills to operate | CF platform team | Kubernetes NetworkPolicy | Kubernetes and Istio |
-
 ## The two rows that decide it
 
-**Enforcement is not a security boundary in Option 2.** Google's own guidance is
-explicit:
+**Outbound enforcement is not a security boundary in Option 2.** Google's own
+guidance:
 
-> The routing configuration of the mesh should not be trusted as a security
-> boundary because there are various ways in which a workload could bypass the mesh
-> proxies. The configuration of the outbound listeners in sidecar proxies should
-> not, on their own, be considered as security controls.
+> The routing configuration of the mesh should not be trusted as a security boundary
+> because there are various ways in which a workload could bypass the mesh proxies.
 
-Istio states the same in its egress task. Making Option 2 an actual control requires
-the layered architecture Google documents: egress gateways on dedicated nodes, VPC
-firewall rules stopping direct egress from workload nodes, NetworkPolicy permitting
-workloads to reach only the egress namespace, and authorization policies on the
-gateway. That is a larger build than `ServiceEntry` alone, and it is what Option 2
-means if it is to replace what Option 1 already enforces.
+Making it one requires the layered architecture Google documents: egress gateways on
+dedicated nodes, VPC firewall rules stopping direct egress from workload nodes,
+NetworkPolicy permitting workloads to reach only the egress namespace, and
+authorization policies on the gateway. That is a larger build than `ServiceEntry`
+alone, and it is what Option 2 means if it is to replace what Option 1 enforces
+today.
 
-**The switch is mesh-wide.** On a managed control plane, `outboundTrafficPolicy` is
-set in the `istio-<release-channel>` ConfigMap in `istio-system`:
+**The outbound switch is mesh-wide.** On a managed control plane,
+`outboundTrafficPolicy` is set in the `istio-<release-channel>` ConfigMap in
+`istio-system`. One setting for every enrolled namespace, so every application's
+`ServiceEntry` must exist before it can be turned on.
 
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: istio-asm-managed-rapid
-  namespace: istio-system
-data:
-  mesh: |-
-    outboundTrafficPolicy:
-      mode: REGISTRY_ONLY
-```
+## What is settled and what is open
 
-One setting for every enrolled namespace. Switching it on before every application's
-`ServiceEntry` exists breaks the ones that are missing, so adoption is all at once
-rather than application by application. Whether a per-namespace equivalent is
-supported is an open question with Google.
+Settled: the two cannot be combined on an enrolled namespace; a non-enrolled
+namespace keeps FQDN policy; Option 1 is built and tested on a sandbox cluster, with
+declared destinations reachable, undeclared dropped, one application's list not
+usable by another, port enforced, and an undeclared caller dropped at the callee.
 
-## What Cloud Foundry had, measured against both
+Open with Google: which of the two they recommend for this requirement; whether the
+mesh recommendation means `ServiceEntry` alone or the full egress architecture;
+whether per-namespace `REGISTRY_ONLY` is supported; confirmation of the enforcement
+semantics we measured; and whether any signal distinguishes enforcing from no longer
+enforcing.
 
-Option 1 reproduces Cloud Foundry's two controls, per-application egress and
-per-caller ingress, and tightens the second by requiring the caller to declare the
-call as well. Nothing is lost.
-
-Option 2 keeps both and adds encryption, workload identity, request-level control
-and per-pair telemetry, none of which Cloud Foundry had. It trades the enforcement
-point from the kernel to a proxy inside the workload, unless the full egress gateway
-architecture is built alongside it.
-
-## Implementation references
+## References
 
 | Topic | Document |
 |---|---|
 | FQDN network policy, syntax and limits | https://cloud.google.com/kubernetes-engine/docs/how-to/fqdn-network-policies |
-| Controlling egress with ServiceEntry, and the REGISTRY_ONLY switch | https://istio.io/latest/docs/tasks/traffic-management/egress/egress-control/ |
-| `ServiceEntry` reference, including `exportTo` | https://istio.io/latest/docs/reference/config/networking/service-entry/ |
-| `Sidecar` reference, including `outboundTrafficPolicy` and `egress.hosts` | https://istio.io/latest/docs/reference/config/networking/sidecar/ |
-| Setting MeshConfig on a managed control plane | https://cloud.google.com/service-mesh/docs/enable-optional-features-managed |
-| Egress gateway best practices, and why routing config is not a security boundary | https://cloud.google.com/service-mesh/docs/security/egress-gateways-best-practices |
-| Egress gateway tutorial on GKE | https://cloud.google.com/service-mesh/docs/security/egress-gateway-gke-tutorial |
-| Istio egress gateway task | https://istio.io/latest/docs/tasks/traffic-management/egress/egress-gateway/ |
-| Feature request: FQDNNetworkPolicy with Cloud Service Mesh | https://issuetracker.google.com/issues/292142566 |
+| Egress control with ServiceEntry and REGISTRY_ONLY | https://istio.io/latest/docs/tasks/traffic-management/egress/egress-control/ |
+| `ServiceEntry` reference | https://istio.io/latest/docs/reference/config/networking/service-entry/ |
+| `Sidecar` reference | https://istio.io/latest/docs/reference/config/networking/sidecar/ |
+| MeshConfig on a managed control plane | https://cloud.google.com/service-mesh/docs/enable-optional-features-managed |
+| Egress gateway best practices | https://cloud.google.com/service-mesh/docs/security/egress-gateways-best-practices |
+| Encryption in transit, VM to VM within a VPC | https://cloud.google.com/docs/security/encryption-in-transit |
+| Feature request: FQDN policy with Cloud Service Mesh | https://issuetracker.google.com/issues/292142566 |
