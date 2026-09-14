@@ -41,11 +41,32 @@ whether the call is encrypted.
 **Inside the cluster is where mTLS applies.** This is the only place the mesh changes
 the transport.
 
-So read the two charts below as answering two different questions.
+## The problem, stated plainly
 
-## Chart A: outbound, which destinations may an application reach
+These are two independent requirements, and nothing about one improves the other.
+A service mesh does nothing for outbound containment. FQDN network policy does
+nothing for traffic inside the cluster.
 
-| | Cloud Foundry today | Option 1: FQDN policy, no mesh | Option 2: mesh, mesh-native egress |
+They are coupled only because GKE does not support FQDN network policy on a
+namespace enrolled in the mesh. That single incompatibility forces a trade between
+two things that have no technical relationship to each other:
+
+    keep FQDN policy  ->  per-application egress enforced in the kernel
+                          no mTLS between applications
+
+    enrol in the mesh ->  mTLS between applications
+                          egress enforcement moves into a proxy in the pod
+
+If the two were supported together, there would be no decision to make: we would run
+FQDN policy for outbound and the mesh for inside, and each would do the job it is
+good at. The whole of this document exists because they cannot be combined.
+
+## Chart A: outbound egress
+
+The mesh contributes nothing to this chart. It appears only because enrolling in it
+removes the mechanism in the middle column.
+
+| | Cloud Foundry today | Option 1: FQDN policy on, mesh off | Option 2: FQDN policy off, mesh-native egress |
 |---|---|---|---|
 | Per-application outbound allowlist | yes, application security groups | yes | yes |
 | Destination expressed as | hostname | hostname | hostname |
@@ -59,7 +80,10 @@ So read the two charts below as answering two different questions.
 
 ## Chart B: inside the cluster, application to application
 
-| | Cloud Foundry today | Option 1: mesh off | Option 2: mesh on |
+FQDN policy contributes nothing to this chart. It appears only because it is what has
+to be switched off to reach the right-hand column.
+
+| | Cloud Foundry today | Option 1: mesh off, FQDN policy on | Option 2: mesh on, FQDN policy off |
 |---|---|---|---|
 | Transport between applications | cleartext over the overlay | cleartext on the pod network, inside a VPC Google encrypts by default | mTLS end to end |
 | Who may call whom | IP-based application security groups | NetworkPolicy, by namespace and pod label | also `AuthorizationPolicy`, by service account identity |
@@ -73,6 +97,9 @@ So read the two charts below as answering two different questions.
 The middle column is already an improvement on what is being replaced: the caller is
 identified by workload rather than by address, and both ends must permit the call.
 The right-hand column is a further step from there, not a repair of a gap.
+
+Note what the right-hand column costs in Chart A. Every gain here is paid for there,
+and only because the two features cannot run together.
 
 ## What Option 2 changes in the policy set
 
